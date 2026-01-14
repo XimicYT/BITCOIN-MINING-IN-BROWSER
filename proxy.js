@@ -1,4 +1,4 @@
-/* NETGRID // MANUAL OVERRIDE BRIDGE */
+/* NETGRID // POOL HOPPER BRIDGE */
 const WebSocket = require('ws');
 const net = require('net');
 
@@ -6,62 +6,89 @@ const PORT = process.env.PORT || 8080;
 const wss = new WebSocket.Server({ port: PORT });
 
 // ---------------------------------------------------------
-// HARDCODED POOL LIST (Skips Cloudflare Check)
-// We cycle through these if one fails
+// DIRECT IP LIST (Bypasses Main Server DNS & Firewall)
 // ---------------------------------------------------------
-const KNOWN_POOLS = [
-    { host: 'server.duinocoin.com', port: 2813 }, // Main 1
-    { host: '51.15.127.80',         port: 2812 }, // Europe
-    { host: 'server.duinocoin.com', port: 2812 }, // Main 2
-    { host: '162.55.103.174',       port: 2811 }  // Catch-all
+const POOL_LIST = [
+    { host: '51.15.127.80',   port: 2812, name: "Europe (Direct)" },      // Often most reliable
+    { host: '162.55.103.174', port: 2811, name: "Community Node 1" },
+    { host: '51.159.175.20',  port: 2812, name: "Community Node 2" },
+    { host: 'magi.duinocoin.com', port: 2811, name: "Magi Pool" },        // Alternate DNS
+    { host: 'server.duinocoin.com', port: 2812, name: "Main Server (Port 2812)" } // Try alt port
 ];
 
-console.log(`[NETGRID] MANUAL BRIDGE ACTIVE ON PORT ${PORT}`);
+console.log(`[NETGRID] POOL HOPPER ACTIVE ON PORT ${PORT}`);
 
 wss.on('connection', (ws) => {
-    console.log('[CLIENT] Connection received. Bypassing API...');
+    console.log('[CLIENT] Browser Connected. Starting Pool Search...');
 
-    // Pick a random pool to spread load
-    const selectedPool = KNOWN_POOLS[Math.floor(Math.random() * KNOWN_POOLS.length)];
-    
-    console.log(`[STRATEGY] Connecting directly to -> ${selectedPool.host}:${selectedPool.port}`);
+    let poolSocket = new net.Socket();
+    let currentPoolIndex = 0;
+    let connected = false;
 
-    const pool = new net.Socket();
-    pool.setEncoding('utf8');
-    pool.setTimeout(10000); // 10s timeout
+    // Function to try the next pool in the list
+    const tryNextPool = () => {
+        if (connected) return;
+        if (currentPoolIndex >= POOL_LIST.length) {
+            console.log('[ERROR] All pools failed. Closing client.');
+            ws.send('ERR: ALL_POOLS_BLOCKED');
+            ws.close();
+            return;
+        }
 
-    pool.connect(selectedPool.port, selectedPool.host, () => {
-        console.log('[POOL] Connected! Pipe established.');
-    });
+        const pool = POOL_LIST[currentPoolIndex];
+        console.log(`[STRATEGY] Trying Pool ${currentPoolIndex + 1}/${POOL_LIST.length}: ${pool.name} (${pool.host})`);
 
-    // Forwarding Logic
-    pool.on('data', (data) => {
-        // Log version to prove it works
-        if(data.toString().includes('.')) console.log(`[POOL SAYS] ${data.toString().trim()}`);
-        ws.send(data.toString());
-    });
+        // Destroy old socket if it exists to clear previous attempt
+        poolSocket.destroy();
+        poolSocket = new net.Socket();
+        poolSocket.setEncoding('utf8');
+        poolSocket.setTimeout(5000); // 5 second timeout per pool
 
-    ws.on('message', (msg) => {
-        pool.write(msg.toString().trim() + '\n');
-    });
+        poolSocket.connect(pool.port, pool.host, () => {
+            console.log(`[SUCCESS] Connected to ${pool.name}!`);
+            connected = true;
+            // Setup regular listeners now that we are connected
+            setupListeners();
+        });
 
-    // Error Handling
-    const cleanup = () => {
-        if (!pool.destroyed) pool.destroy();
-        ws.close();
+        poolSocket.on('error', (err) => {
+            if (!connected) {
+                console.log(`[FAIL] ${pool.name} failed: ${err.message}`);
+                currentPoolIndex++;
+                tryNextPool();
+            }
+        });
+
+        poolSocket.on('timeout', () => {
+            if (!connected) {
+                console.log(`[FAIL] ${pool.name} timed out.`);
+                currentPoolIndex++;
+                tryNextPool();
+            }
+        });
     };
 
-    pool.on('error', (err) => {
-        console.error(`[POOL ERROR] ${err.message}`);
-        ws.send('ERR: POOL_FAILED');
-        cleanup();
-    });
+    // Listeners for data/messaging (Only active after successful connect)
+    const setupListeners = () => {
+        poolSocket.on('data', (data) => {
+            if (data.toString().includes('.')) console.log(`[POOL SAYS] ${data.toString().trim()}`);
+            ws.send(data.toString());
+        });
 
-    pool.on('timeout', () => {
-        console.error('[POOL] Timeout. Server blocked us?');
-        cleanup();
-    });
+        ws.on('message', (msg) => {
+            poolSocket.write(msg.toString().trim() + '\n');
+        });
 
-    pool.on('close', cleanup);
-    ws.on('close', cleanup);
+        poolSocket.on('close', () => {
+            console.log('[POOL] Connection lost.');
+            ws.close();
+        });
+        
+        ws.on('close', () => {
+            poolSocket.destroy();
+        });
+    };
+
+    // Kick off the search
+    tryNextPool();
 });
