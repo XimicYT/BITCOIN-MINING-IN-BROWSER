@@ -1,0 +1,15 @@
+{
+  "name": "netgrid-proxy",
+  "version": "1.0.0",
+  "description": "Stratum Bridge",
+  "main": "proxy.js",
+  "scripts": {
+    "start": "node proxy.js"
+  },
+  "dependencies": {
+    "ws": "^8.16.0"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  }
+}
