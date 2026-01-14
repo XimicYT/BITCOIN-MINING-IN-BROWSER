@@ -1,90 +1,67 @@
-/* NETGRID // HEAVY DEBUG BRIDGE */
+/* NETGRID // MANUAL OVERRIDE BRIDGE */
 const WebSocket = require('ws');
 const net = require('net');
-const https = require('https');
 
 const PORT = process.env.PORT || 8080;
 const wss = new WebSocket.Server({ port: PORT });
 
-console.log(`[SYSTEM] DEBUG BRIDGE ACTIVE ON PORT ${PORT}`);
-console.log(`[SYSTEM] Waiting for browser connections...`);
+// ---------------------------------------------------------
+// HARDCODED POOL LIST (Skips Cloudflare Check)
+// We cycle through these if one fails
+// ---------------------------------------------------------
+const KNOWN_POOLS = [
+    { host: 'server.duinocoin.com', port: 2813 }, // Main 1
+    { host: '51.15.127.80',         port: 2812 }, // Europe
+    { host: 'server.duinocoin.com', port: 2812 }, // Main 2
+    { host: '162.55.103.174',       port: 2811 }  // Catch-all
+];
 
-// Helper: Get Pool
-function getPool(callback) {
-    console.log('[API] Contacting Duino-Coin Master Server to find a pool...');
+console.log(`[NETGRID] MANUAL BRIDGE ACTIVE ON PORT ${PORT}`);
+
+wss.on('connection', (ws) => {
+    console.log('[CLIENT] Connection received. Bypassing API...');
+
+    // Pick a random pool to spread load
+    const selectedPool = KNOWN_POOLS[Math.floor(Math.random() * KNOWN_POOLS.length)];
     
-    const req = https.get('https://server.duinocoin.com/getPool', (res) => {
-        let data = '';
-        res.on('data', chunk => data += chunk);
-        res.on('end', () => {
-            try {
-                const result = JSON.parse(data);
-                console.log(`[API] SUCCESS. Master Server assigned: ${result.ip}:${result.port} (${result.name})`);
-                callback(result.ip, result.port);
-            } catch (e) {
-                console.error(`[API] ERROR: Could not parse JSON. Raw data: ${data}`);
-                console.log('[API] Swapping to Emergency Fallback (server.duinocoin.com:2813)');
-                callback('server.duinocoin.com', 2813);
-            }
-        });
+    console.log(`[STRATEGY] Connecting directly to -> ${selectedPool.host}:${selectedPool.port}`);
+
+    const pool = new net.Socket();
+    pool.setEncoding('utf8');
+    pool.setTimeout(10000); // 10s timeout
+
+    pool.connect(selectedPool.port, selectedPool.host, () => {
+        console.log('[POOL] Connected! Pipe established.');
     });
-    
-    req.on('error', (err) => {
-        console.error(`[API] NETWORK ERROR: ${err.message}`);
-        console.log('[API] Swapping to Emergency Fallback (server.duinocoin.com:2813)');
-        callback('server.duinocoin.com', 2813);
+
+    // Forwarding Logic
+    pool.on('data', (data) => {
+        // Log version to prove it works
+        if(data.toString().includes('.')) console.log(`[POOL SAYS] ${data.toString().trim()}`);
+        ws.send(data.toString());
     });
-}
 
-wss.on('connection', (ws, req) => {
-    const clientIp = req.socket.remoteAddress;
-    console.log(`\n[CLIENT] New Connection from ${clientIp}`);
-    console.log('[CLIENT] Initiating Pool Lookup...');
-
-    getPool((poolHost, poolPort) => {
-        console.log(`[POOL] Attempting TCP Connection to -> ${poolHost}:${poolPort}`);
-        
-        const pool = new net.Socket();
-        pool.setEncoding('utf8');
-        pool.setTimeout(10000); // 10 second timeout
-
-        // Attempt Connect
-        pool.connect(poolPort, poolHost, () => {
-            console.log('[POOL] TCP Socket Established. Waiting for Version String...');
-        });
-
-        // Data received from Pool
-        pool.on('data', (data) => {
-            const msg = data.toString().trim();
-            console.log(`[POOL -> CLIENT] ${msg}`);
-            ws.send(data.toString());
-        });
-
-        // Data sent from Client
-        ws.on('message', (msg) => {
-            console.log(`[CLIENT -> POOL] ${msg}`);
-            pool.write(msg.toString().trim() + '\n');
-        });
-
-        // Errors
-        pool.on('error', (err) => {
-            console.error(`[POOL] SOCKET ERROR: ${err.message}`);
-            ws.send(`ERR: POOL_CONNECTION_FAILED: ${err.message}`);
-        });
-
-        pool.on('timeout', () => {
-            console.error(`[POOL] TIMEOUT. The pool ${poolHost} did not answer in 10s.`);
-            pool.end();
-        });
-
-        pool.on('close', () => {
-            console.log('[POOL] Connection Closed.');
-            ws.close();
-        });
-
-        ws.on('close', () => {
-            console.log('[CLIENT] Browser disconnected.');
-            pool.destroy();
-        });
+    ws.on('message', (msg) => {
+        pool.write(msg.toString().trim() + '\n');
     });
+
+    // Error Handling
+    const cleanup = () => {
+        if (!pool.destroyed) pool.destroy();
+        ws.close();
+    };
+
+    pool.on('error', (err) => {
+        console.error(`[POOL ERROR] ${err.message}`);
+        ws.send('ERR: POOL_FAILED');
+        cleanup();
+    });
+
+    pool.on('timeout', () => {
+        console.error('[POOL] Timeout. Server blocked us?');
+        cleanup();
+    });
+
+    pool.on('close', cleanup);
+    ws.on('close', cleanup);
 });
